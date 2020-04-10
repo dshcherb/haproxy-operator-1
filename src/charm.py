@@ -9,12 +9,10 @@ import subprocess
 
 from ops.charm import CharmBase
 from ops.main import main
-from ops.framework import StoredState
-from ops.model import ActiveStatus, BlockedStatus
+from ops.model import ActiveStatus, BlockedStatus, MaintenanceStatus
 
-from jinja2 import Environment, FileSystemLoader
-from pathlib import Path
-from interface_proxy_listen_tcp import ProxyListenTcpInterfaceRequires
+from haproxy_instance_manager import HaproxyInstanceManager
+from tcp_lb import TCPBackendManager
 from interface_vrrp_parameters import (
     VRRPParametersProvides,
     VRRPInstance,
@@ -26,74 +24,56 @@ logger = logging.getLogger(__name__)
 
 class HaproxyCharm(CharmBase):
 
-    state = StoredState()
-
-    HAPROXY_ENV_FILE = Path('/etc/default/haproxy')
+    tcp_backend_manager_cls = TCPBackendManager
 
     def __init__(self, *args):
         super().__init__(*args)
-
-        self.state.set_default(started=False)
-
-        self.haproxy_conf_file = Path(f'/etc/haproxy/juju-{self.app.name}.cfg')
 
         self.framework.observe(self.on.install, self.on_install)
         self.framework.observe(self.on.start, self.on_start)
         self.framework.observe(self.on.stop, self.on_stop)
         self.framework.observe(self.on.config_changed, self.on_config_changed)
 
-        self.tcp_backends = ProxyListenTcpInterfaceRequires(self, 'proxy-listen-tcp')
-        self.framework.observe(self.tcp_backends.on.backends_changed, self.on_backends_changed)
+        self.tcp_backend_manager = self.tcp_backend_manager_cls(self, 'tcp-load-balancer')
+        self.framework.observe(self.tcp_backend_manager.on.pools_changed, self._on_pools_changed)
+
+        self.haproxy_instance_manager = HaproxyInstanceManager(self, 'haproxy_instance_manager',
+                                                               self.tcp_backend_manager)
 
         self.keepalived = VRRPParametersProvides(self, 'vrrp-parameters')
         self.framework.observe(self.keepalived.on.keepalived_available,
                                self.on_keepalived_available)
 
     def on_install(self, event):
-        subprocess.check_call(['apt', 'update'])
-        subprocess.check_call(['apt', 'install', '-yq', 'haproxy'])
-
-        ctxt = {'haproxy_app_config': self.haproxy_conf_file}
-        env = Environment(loader=FileSystemLoader('templates'))
-        template = env.get_template('haproxy.env.j2')
-        rendered_content = template.render(ctxt)
-        self.HAPROXY_ENV_FILE.write_text(rendered_content)
-        self.haproxy_conf_file.write_text('')
+        self.haproxy_instance_manager.install()
 
     def on_start(self, event):
-        if not self.state.started:
-            subprocess.check_call(['systemctl', 'start', 'haproxy'])
-            self.state.started = True
-
+        self.haproxy_instance_manager.start()
         self.model.unit.status = ActiveStatus()
 
     def on_stop(self, event):
-        if self.state.started:
-            # TODO: handle the new "remove" hook https://github.com/juju/juju/pull/11237
-            subprocess.check_call(['systemctl', 'stop', 'haproxy'])
-            self.state.started = False
+        self.haproxy_instance_manager.stop()
+        self.model.unit.status = BlockedStatus('the haproxy service is stopped')
+
+    def on_remote(self, event):
+        self.haproxy_instance_manager.uninstall()
 
     def on_config_changed(self, event):
         self.reconfigure_haproxy()
         self.reconfigure_keepalived()
         subprocess.check_call(['systemctl', 'restart', 'haproxy'])
 
-    def on_backends_changed(self, event):
+    def _on_pools_changed(self, event):
         self.reconfigure_haproxy()
         self.reconfigure_keepalived()
 
     def reconfigure_haproxy(self):
-        ctxt = {
-            'listen_proxies': self.tcp_backends.listen_proxies
-        }
-        env = Environment(loader=FileSystemLoader('templates'))
-        template = env.get_template('haproxy.conf.j2')
-        rendered_content = template.render(ctxt)
-        self.haproxy_conf_file.write_text(rendered_content)
-        subprocess.check_call(['systemctl', 'restart', 'haproxy'])
+        self.unit.status = MaintenanceStatus('reconfiguring haproxy')
+        self.haproxy_instance_manager.reconfigure()
+        self.unit.status = ActiveStatus()
 
     def on_keepalived_available(self, event):
-        if not self.state.started:
+        if not self.haproxy_instance_manager.is_started:
             event.defer()
         self.reconfigure_keepalived()
 

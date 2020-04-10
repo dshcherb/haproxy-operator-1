@@ -7,10 +7,9 @@ tags: ["cache-proxy"]
 series:
     - bionic
     - focal
-requires:
-    proxy-listen-tcp:
-        interface: proxy-listen-tcp
 provides:
+    tcp-load-balancer:
+        interface: tcp-load-balancer
     website:
         interface: http
     vrrp-parameters:
